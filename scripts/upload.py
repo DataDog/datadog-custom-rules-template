@@ -112,6 +112,7 @@ def fetch_remote_rulesets(session: requests.Session, base_url: str) -> dict[str,
                     "category": rev.get("category", ""),
                     "arguments": rev.get("arguments") or [],
                     "tests": rev.get("tests") or [],
+                    "is_published": rev.get("is_published", False),
                 }
                 if rev
                 else None
@@ -238,7 +239,7 @@ def build_revision_payload(rule: dict[str, Any]) -> dict[str, Any]:
         "data": {
             "type": "custom_rule_revision",
             "attributes": {
-                "id": "1",
+                "id": rule["name"],
                 "short_description": b64(rule.get("short_description", "")),
                 "description": b64(rule.get("description", "")),
                 "language": rule["language"],
@@ -248,7 +249,7 @@ def build_revision_payload(rule: dict[str, Any]) -> dict[str, Any]:
                 "category": rule["category"],
                 "arguments": arguments,
                 "tests": tests,
-                "is_published": True,
+                "is_published": rule.get("is_published", False),
                 "should_use_ai_fix": False,
                 "is_testing": False,
             },
@@ -294,6 +295,7 @@ def sync_rule(
             or rule["category"] != remote_rule["category"]
             or local_arguments != remote_rule["arguments"]
             or local_tests != remote_rule["tests"]
+            or rule.get("is_published", False) != remote_rule["is_published"]
         )
         if not changed:
             if dry_run:
