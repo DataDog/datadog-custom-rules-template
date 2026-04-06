@@ -136,6 +136,15 @@ def upsert_ruleset(
     """Returns True if changed, None if no-op, False if failed."""
     name = meta["name"]
     exists = remote is not None
+
+    if exists:
+        changed = (
+            b64(meta.get("short_description", "")) != remote["short_description"]
+            or b64(meta.get("description", "")) != remote["description"]
+        )
+        if not changed:
+            return None
+
     action = "Would update" if exists else "Would create"
     if dry_run:
         logger.info("[dry-run] {action} ruleset: {name}", action=action, name=name)
@@ -153,12 +162,6 @@ def upsert_ruleset(
         }
     }
     if exists:
-        changed = (
-            b64(meta.get("short_description", "")) != remote["short_description"]
-            or b64(meta.get("description", "")) != remote["description"]
-        )
-        if not changed:
-            return None
         remote_id = remote["id"]
         resp = session.patch(
             f"{base_url}/rulesets/{remote_id}", json=payload, timeout=10
@@ -359,8 +362,6 @@ def sync_ruleset(
     exists = remote is not None
     remote_rules = remote["rules"] if exists else {}
 
-    logger.info("Ruleset: {name}", name=name)
-
     ruleset_changed = upsert_ruleset(session, base_url, meta, remote, dry_run)
     if ruleset_changed is False:
         return False
@@ -383,15 +384,18 @@ def sync_ruleset(
 
     if failed_rules:
         logger.error(
-            "  FAILED: {count} rule(s) failed: {rules}",
+            "Ruleset: {name} — {count} rule(s) failed: {rules}",
+            name=name,
             count=len(failed_rules),
             rules=", ".join(failed_rules),
         )
         return False
 
-    actually_changed = ruleset_changed is True or any_rule_changed or bool(deleted_rules)
-    if not actually_changed:
-        logger.info("  No changes")
+    if ruleset_changed is True or any_rule_changed or deleted_rules:
+        action = "updated" if exists else "created"
+        logger.info("Ruleset: {name} — {action}", name=name, action=action)
+    else:
+        logger.info("Ruleset: {name} — no changes", name=name)
     return True
 
 

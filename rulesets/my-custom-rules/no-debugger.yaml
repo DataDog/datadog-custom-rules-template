@@ -9,6 +9,7 @@ description: |-
 category: BEST_PRACTICES
 severity: ERROR
 language: JAVASCRIPT
+checksum: 7329459e9a538c29dceace92528d61fec64d0882e5412eb16937932311a70fbf
 arguments: []
 tree_sitter_query: (debugger_statement) @stmt
 code: |-
@@ -24,17 +25,17 @@ code: |-
     ));
   }
 tests:
-  - filename: NotCompliant.js
-    code: |-
-      function fetchData() {
-        debugger;
-        return fetch("/api/data");
-      }
-    annotation_count: 1
-  - filename: Compliant.js
-    code: |-
-      function fetchData() {
-        return fetch("/api/data");
-      }
-    annotation_count: 0
+- filename: NotCompliant.js
+  code: |-
+    function fetchData() {
+      debugger;
+      return fetch("/api/data");
+    }
+  annotation_count: 1
+- filename: Compliant.js
+  code: |-
+    function fetchData() {
+      return fetch("/api/data");
+    }
+  annotation_count: 0
 is_published: false
