@@ -1,0 +1,3 @@
+name: my-custom-rules
+short_description: Custom static analysis rules for my organization
+description: Custom security and best practice rules tailored for our codebase.

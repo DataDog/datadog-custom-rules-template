@@ -11,45 +11,38 @@ static analysis API (v2). On each run the script:
 Required env vars:
   DD_API_KEY           - Datadog API key
   DD_APP_KEY           - Datadog Application key
-  DD_SITE              - Datadog site (e.g. datadoghq.com, datadoghq.eu)
+  DD_SITE              - Datadog site (default: datadoghq.com)
 """
 
 import argparse
 import base64
-import operator
 import os
-import random
 import sys
 from pathlib import Path
+from typing import Any
 
 import requests
 import yaml
+from loguru import logger
+
+
+def setup_logging() -> None:
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    )
+
 
 RULESETS_DIR = Path(__file__).parent.parent / "rulesets"
 
-
-def confirm() -> bool:
-    ops = {
-        "+": operator.add,
-        "-": operator.sub,
-        "*": operator.mul,
-    }
-    symbol, fn = random.choice(list(ops.items()))
-    a, b = random.randint(1, 12), random.randint(1, 12)
-    answer = fn(a, b)
-    try:
-        guess = input(f"Confirm: {a} {symbol} {b} = ")
-    except (KeyboardInterrupt, EOFError):
-        print()
-        return False
-    return guess.strip() == str(answer)
 
 
 def b64(s: str) -> str:
     return base64.b64encode(s.encode()).decode()
 
 
-def read_local_rulesets(rulesets_dir: Path) -> dict[str, dict]:
+def read_local_rulesets(rulesets_dir: Path) -> dict[str, dict[str, Any]]:
     """
     Walk rulesets_dir and return:
       { ruleset_name: {"meta": {...}, "rules": {rule_name: rule_dict}} }
@@ -60,7 +53,9 @@ def read_local_rulesets(rulesets_dir: Path) -> dict[str, dict]:
             continue
         meta_file = ruleset_dir / "ruleset.yaml"
         if not meta_file.exists():
-            print(f"  WARNING: {ruleset_dir.name}/ has no ruleset.yaml — skipping")
+            logger.warning(
+                "{dir}/ has no ruleset.yaml — skipping", dir=ruleset_dir.name
+            )
             continue
 
         with meta_file.open() as f:
@@ -78,38 +73,71 @@ def read_local_rulesets(rulesets_dir: Path) -> dict[str, dict]:
     return result
 
 
-def fetch_remote_rulesets(
-    session: requests.Session, base_url: str
-) -> dict[str, dict]:
+def fetch_remote_rulesets(session: requests.Session, base_url: str) -> dict[str, dict[str, Any]]:
     """
     GET /custom/rulesets → returns all rulesets with rules inline.
-    Returns { ruleset_name: {"id": ..., "rules": set_of_rule_names} }.
+    Returns:
+      {
+        ruleset_name: {
+          "id": str,
+          "short_description": str,  # b64 as returned by API
+          "description": str,        # b64 as returned by API
+          "rules": {
+            rule_name: {             # fields from last_revision, b64 as-is
+              "short_description", "description", "code",
+              "tree_sitter_query", "language", "severity", "category"
+            } | None                 # None if rule has no revision yet
+          }
+        }
+      }
     """
     resp = session.get(f"{base_url}/rulesets", timeout=10)
     resp.raise_for_status()
     data = resp.json().get("data") or []
 
-    return {
-        item["attributes"]["name"]: {
+    result = {}
+    for item in data:
+        attrs = item["attributes"]
+        rules = {}
+        for r in attrs.get("rules") or []:
+            rev = r.get("last_revision")
+            rules[r["name"]] = (
+                {
+                    "short_description": rev.get("short_description", ""),
+                    "description": rev.get("description", ""),
+                    "code": rev.get("code", ""),
+                    "tree_sitter_query": rev.get("tree_sitter_query", ""),
+                    "language": rev.get("language", ""),
+                    "severity": rev.get("severity", ""),
+                    "category": rev.get("category", ""),
+                    "arguments": rev.get("arguments") or [],
+                    "tests": rev.get("tests") or [],
+                }
+                if rev
+                else None
+            )
+        result[attrs["name"]] = {
             "id": item["id"],
-            "rules": {r["name"] for r in (item["attributes"].get("rules") or [])},
+            "short_description": attrs.get("short_description", ""),
+            "description": attrs.get("description", ""),
+            "rules": rules,
         }
-        for item in data
-    }
+    return result
 
 
 def upsert_ruleset(
     session: requests.Session,
     base_url: str,
-    meta: dict,
-    remote: dict | None,
+    meta: dict[str, Any],
+    remote: dict[str, Any] | None,
     dry_run: bool,
-) -> bool:
+) -> bool | None:
+    """Returns True if changed, None if no-op, False if failed."""
     name = meta["name"]
     exists = remote is not None
     action = "Would update" if exists else "Would create"
     if dry_run:
-        print(f"  [dry-run] {action} ruleset: {name}")
+        logger.info("[dry-run] {action} ruleset: {name}", action=action, name=name)
         return True
 
     payload = {
@@ -124,14 +152,26 @@ def upsert_ruleset(
         }
     }
     if exists:
+        changed = (
+            b64(meta.get("short_description", "")) != remote["short_description"]
+            or b64(meta.get("description", "")) != remote["description"]
+        )
+        if not changed:
+            return None
         remote_id = remote["id"]
-        resp = session.patch(f"{base_url}/rulesets/{remote_id}", json=payload, timeout=10)
+        resp = session.patch(
+            f"{base_url}/rulesets/{remote_id}", json=payload, timeout=10
+        )
     else:
         resp = session.put(f"{base_url}/rulesets", json=payload, timeout=10)
 
     if not resp.ok:
-        print(
-            f"  FAILED to {'update' if exists else 'create'} ruleset {name} — HTTP {resp.status_code}: {resp.text}"
+        logger.error(
+            "FAILED to {action} ruleset {name} — HTTP {status}: {text}",
+            action="update" if exists else "create",
+            name=name,
+            status=resp.status_code,
+            text=resp.text,
         )
         return False
     return True
@@ -141,15 +181,18 @@ def delete_ruleset(
     session: requests.Session, base_url: str, name: str, dry_run: bool
 ) -> bool:
     if dry_run:
-        print(f"  [dry-run] Would delete ruleset: {name}")
+        logger.info("[dry-run] Would delete ruleset: {name}", name=name)
         return True
     resp = session.delete(f"{base_url}/rulesets/{name}", timeout=10)
     if not resp.ok:
-        print(
-            f"  FAILED to delete ruleset {name} — HTTP {resp.status_code}: {resp.text}"
+        logger.error(
+            "FAILED to delete ruleset {name} — HTTP {status}: {text}",
+            name=name,
+            status=resp.status_code,
+            text=resp.text,
         )
         return False
-    print(f"  Deleted ruleset: {name}")
+    logger.info("Deleted ruleset: {name}", name=name)
     return True
 
 
@@ -161,21 +204,24 @@ def delete_rule(
     dry_run: bool,
 ) -> bool:
     if dry_run:
-        print(f"    [dry-run] Would delete rule: {rule_name}")
+        logger.info("[dry-run] Would delete rule: {rule_name}", rule_name=rule_name)
         return True
     resp = session.delete(
         f"{base_url}/rulesets/{ruleset_name}/rules/{rule_name}", timeout=10
     )
     if not resp.ok:
-        print(
-            f"    FAILED to delete rule {rule_name} — HTTP {resp.status_code}: {resp.text}"
+        logger.error(
+            "FAILED to delete rule {rule_name} — HTTP {status}: {text}",
+            rule_name=rule_name,
+            status=resp.status_code,
+            text=resp.text,
         )
         return False
-    print(f"    Deleted rule: {rule_name}")
+    logger.info("  Deleted rule: {rule_name}", rule_name=rule_name)
     return True
 
 
-def build_revision_payload(rule: dict) -> dict:
+def build_revision_payload(rule: dict[str, Any]) -> dict[str, Any]:
     tests = [
         {
             "filename": t["filename"],
@@ -214,16 +260,51 @@ def sync_rule(
     session: requests.Session,
     base_url: str,
     ruleset_name: str,
-    rule: dict,
-    exists: bool,
+    rule: dict[str, Any],
+    remote_rule: dict[str, Any] | None,
     dry_run: bool,
-) -> bool:
+) -> bool | None:
+    """Returns True if changed, None if no-op, False if failed."""
     rule_name = rule["name"]
     rules_url = f"{base_url}/rulesets/{ruleset_name}/rules"
+    exists = remote_rule is not None
+
+    # Skip if nothing has changed
+    if remote_rule is not None:
+        local_arguments = [
+            {"name": b64(a["name"]), "description": b64(a.get("description", ""))}
+            for a in rule.get("arguments", [])
+        ]
+        local_tests = [
+            {
+                "filename": t["filename"],
+                "code": b64(t["code"]),
+                "annotation_count": t["annotation_count"],
+            }
+            for t in rule.get("tests", [])
+        ]
+        changed = (
+            b64(rule.get("short_description", "")) != remote_rule["short_description"]
+            or b64(rule.get("description", "")) != remote_rule["description"]
+            or b64(rule["code"]) != remote_rule["code"]
+            or b64(rule.get("tree_sitter_query", ""))
+            != remote_rule["tree_sitter_query"]
+            or rule["language"] != remote_rule["language"]
+            or rule["severity"] != remote_rule["severity"]
+            or rule["category"] != remote_rule["category"]
+            or local_arguments != remote_rule["arguments"]
+            or local_tests != remote_rule["tests"]
+        )
+        if not changed:
+            if dry_run:
+                logger.info("[dry-run] No changes: {rule_name}", rule_name=rule_name)
+            return None
 
     if dry_run:
         action = "Would update" if exists else "Would create"
-        print(f"    [dry-run] {action} rule: {rule_name}")
+        logger.info(
+            "[dry-run] {action} rule: {rule_name}", action=action, rule_name=rule_name
+        )
         return True
 
     # Create rule stub if it doesn't exist
@@ -236,8 +317,11 @@ def sync_rule(
         }
         resp = session.put(rules_url, json=create_payload, timeout=10)
         if not resp.ok:
-            print(
-                f"    FAILED to create rule stub {rule_name} — HTTP {resp.status_code}: {resp.text}"
+            logger.error(
+                "FAILED to create rule stub {rule_name} — HTTP {status}: {text}",
+                rule_name=rule_name,
+                status=resp.status_code,
+                text=resp.text,
             )
             return False
 
@@ -248,11 +332,16 @@ def sync_rule(
         timeout=10,
     )
     if not rev_resp.ok:
-        print(
-            f"    FAILED to push revision for {rule_name} — HTTP {rev_resp.status_code}: {rev_resp.text}"
+        logger.error(
+            "FAILED to push revision for {rule_name} — HTTP {status}: {text}",
+            rule_name=rule_name,
+            status=rev_resp.status_code,
+            text=rev_resp.text,
         )
         return False
 
+    action = "Created" if not exists else "Updated"
+    logger.info("  {action} rule: {rule_name}", action=action, rule_name=rule_name)
     return True
 
 
@@ -260,37 +349,47 @@ def sync_ruleset(
     session: requests.Session,
     base_url: str,
     dry_run: bool,
-    meta: dict,
-    rules: dict[str, dict],
-    remote: dict | None,
+    meta: dict[str, Any],
+    rules: dict[str, dict[str, Any]],
+    remote: dict[str, Any] | None,
 ) -> bool:
     name = meta["name"]
     exists = remote is not None
-    remote_rule_names = remote["rules"] if exists else None
+    remote_rules = remote["rules"] if exists else {}
 
-    if not upsert_ruleset(session, base_url, meta, remote, dry_run):
+    logger.info("Ruleset: {name}", name=name)
+
+    ruleset_changed = upsert_ruleset(session, base_url, meta, remote, dry_run)
+    if ruleset_changed is False:
         return False
 
     # Delete rules that are in the backend but no longer on disk
-    if remote_rule_names:
-        for remote_rule in sorted(remote_rule_names - set(rules)):
-            delete_rule(session, base_url, name, remote_rule, dry_run)
+    deleted_rules = sorted(set(remote_rules) - set(rules))
+    for remote_rule_name in deleted_rules:
+        delete_rule(session, base_url, name, remote_rule_name, dry_run)
 
     # Sync each local rule
     failed_rules = []
+    any_rule_changed = False
     for rule in rules.values():
-        rule_exists = remote_rule_names is not None and rule["name"] in remote_rule_names
-        if not sync_rule(session, base_url, name, rule, rule_exists, dry_run):
+        remote_rule = remote_rules.get(rule["name"])  # None if new, dict if existing
+        result = sync_rule(session, base_url, name, rule, remote_rule, dry_run)
+        if result is False:
             failed_rules.append(rule["name"])
+        elif result is True:
+            any_rule_changed = True
 
     if failed_rules:
-        print(
-            f"  FAILED: {name} — {len(failed_rules)} rule(s) failed: {', '.join(failed_rules)}"
+        logger.error(
+            "  FAILED: {count} rule(s) failed: {rules}",
+            count=len(failed_rules),
+            rules=", ".join(failed_rules),
         )
         return False
 
-    action = "Updated" if exists else "Created"
-    print(f"  {action}: {name} ({len(rules)} rule{'s' if len(rules) != 1 else ''})")
+    actually_changed = ruleset_changed is True or any_rule_changed or bool(deleted_rules)
+    if not actually_changed:
+        logger.info("  No changes")
     return True
 
 
@@ -308,23 +407,24 @@ def main() -> None:
     app_key = os.environ.get("DD_APP_KEY")
     site = os.environ.get("DD_SITE")
 
+    if not site:
+        site = "datadoghq.com"
+
     missing = [
-        k
-        for k, v in {
-            "DD_API_KEY": api_key,
-            "DD_APP_KEY": app_key,
-            "DD_SITE": site,
-        }.items()
-        if not v
+        k for k, v in {"DD_API_KEY": api_key, "DD_APP_KEY": app_key}.items() if not v
     ]
+    setup_logging()
+
     if missing:
-        print(f"ERROR: Missing required environment variable(s): {', '.join(missing)}")
+        logger.error(
+            "Missing required environment variable(s): {vars}", vars=", ".join(missing)
+        )
         sys.exit(1)
     base_url = f"https://api.{site}/api/v2/static-analysis/custom"
 
     local = read_local_rulesets(RULESETS_DIR)
     if not local:
-        print("No rulesets found in rulesets/")
+        logger.info("No rulesets found in rulesets/")
         sys.exit(0)
 
     session = requests.Session()
@@ -333,18 +433,14 @@ def main() -> None:
     session.headers["Content-Type"] = "application/json"
 
     if dry_run:
-        print("Dry run — no changes will be made.\n")
-    else:
-        if not confirm():
-            print("Incorrect. Aborting.")
-            sys.exit(1)
+        logger.info("Dry run — no changes will be made.")
 
-    print(f"Syncing {len(local)} ruleset(s) to {site}...")
+    logger.info("Syncing {count} ruleset(s) to {site}...", count=len(local), site=site)
 
     try:
         remote = fetch_remote_rulesets(session, base_url)
     except requests.exceptions.RequestException as e:
-        print(f"ERROR: Failed to fetch remote rulesets: {e}")
+        logger.error("Failed to fetch remote rulesets: {e}", e=e)
         sys.exit(1)
 
     failures = 0
@@ -357,15 +453,16 @@ def main() -> None:
     # Sync local rulesets
     for name, rs in local.items():
         remote_rs = remote.get(name)  # None if new, dict with id+rules if existing
-        if not sync_ruleset(session, base_url, dry_run, rs["meta"], rs["rules"], remote_rs):
+        if not sync_ruleset(
+            session, base_url, dry_run, rs["meta"], rs["rules"], remote_rs
+        ):
             failures += 1
 
-    print()
     if failures:
-        print(f"{failures} ruleset(s) had failures.")
+        logger.error("{count} ruleset(s) had failures.", count=failures)
         sys.exit(1)
 
-    print(f"All {len(local)} ruleset(s) synced successfully.")
+    logger.info("All {count} ruleset(s) synced successfully.", count=len(local))
 
 
 if __name__ == "__main__":

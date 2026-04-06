@@ -7,7 +7,7 @@ A template for managing custom [Datadog Static Analysis](https://docs.datadoghq.
 ## Getting started
 
 1. Click **Use this template** on GitHub to create your own copy of this repo.
-2. Add your Datadog API key and Application key as GitHub secrets (see [Authentication](#authentication)).
+2. Add your Datadog credentials as GitHub secrets (see [Authentication](#authentication)).
 3. Rename `rulesets/my-custom-rules/` or add new ruleset directories under `rulesets/`.
 4. Push to `main` — the GitHub Action uploads your rules automatically.
 
@@ -17,7 +17,7 @@ A template for managing custom [Datadog Static Analysis](https://docs.datadoghq.
 rulesets/
   my-custom-rules/
     ruleset.yaml        # Ruleset metadata (name, description)
-    no-eval.yaml        # Example rule — rename or delete this
+    no-debugger.yaml    # Example rule — replace or delete this
     your-rule.yaml      # Add your own rules here
 scripts/
   upload.py             # Sync script (no changes needed)
@@ -30,16 +30,25 @@ uv.lock
 
 ## Authentication
 
-The upload script authenticates with your Datadog API key and Application key.
-
 1. In your GitHub repo, go to **Settings → Secrets and variables → Actions**.
-2. Add two **secrets**:
+2. Add three **secrets**:
    - `DD_API_KEY` — your [Datadog API key](https://app.datadoghq.com/organization-settings/api-keys)
    - `DD_APP_KEY` — your [Datadog Application key](https://app.datadoghq.com/organization-settings/application-keys)
+   - `DD_SITE` — your Datadog site hostname (e.g. `datadoghq.com`, `datadoghq.eu`, `us3.datadoghq.com`)
 
-3. Add a third secret named `DD_SITE` with your Datadog site hostname (e.g. `datadoghq.com`, `datadoghq.eu`, `us3.datadoghq.com`).
+## How sync works
 
-## How to test locally
+On every push to `main`, the GitHub Action runs `upload.py` which:
+
+- **Creates** rulesets and rules that are new on disk
+- **Updates** rulesets and rules whose content has changed
+- **Deletes** rulesets and rules that have been removed from disk
+
+Only changed rules trigger API calls — unchanged rules are skipped.
+
+You can also trigger a sync manually from the **Actions** tab without pushing a commit. Click **Upload Custom Rules → Run workflow**.
+
+## Testing locally
 
 ```bash
 export DD_API_KEY=<your-api-key>
@@ -49,16 +58,22 @@ export DD_SITE=datadoghq.com
 uv run scripts/upload.py
 ```
 
+To preview what the sync would do without making any API calls — useful for validating changes before they hit the GitHub Action:
+
+```bash
+uv run scripts/upload.py --dry-run
+```
+
 To target staging instead of production:
 
 ```bash
-export DD_SITE=dd.datad0g.com
+export DD_SITE=datad0g.com
 uv run scripts/upload.py
 ```
 
 ## Writing rules
 
-Each ruleset is a directory under `rulesets/` containing a `ruleset.yaml` and one `.yaml` file per rule. The `no-eval.yaml` example is a good starting point.
+Each ruleset is a directory under `rulesets/` containing a `ruleset.yaml` and one `.yaml` file per rule.
 
 ### ruleset.yaml
 
@@ -68,55 +83,50 @@ short_description: One-line summary
 description: Longer description of what this ruleset covers.
 ```
 
-### Rule file (e.g. `my-rule.yaml`)
+### Rule file (e.g. `no-debugger.yaml`)
 
 ```yaml
-name: my-rule                   # Must match the filename (without .yaml)
-short_description: One-line summary
+name: no-debugger
+short_description: Disallow the use of debugger
 description: |-
-  Detailed description. Supports markdown.
-category: SECURITY              # SECURITY | BEST_PRACTICES | CODE_STYLE | ERROR_PRONE | PERFORMANCE
-severity: WARNING               # ERROR | WARNING | NOTICE | NONE
-language: PYTHON                # See supported languages below
-checksum: ""                    # Leave blank — computed by the server
-cwe: "89"                       # Optional CWE identifier
+  The `debugger` statement pauses execution and opens the browser debugger. It should
+  never appear in production code as it can expose internals and halt execution for end users.
+  See [CWE-489](https://cwe.mitre.org/data/definitions/489.html).
+category: BEST_PRACTICES        # SECURITY | BEST_PRACTICES | CODE_STYLE | ERROR_PRONE | PERFORMANCE
+severity: ERROR                 # ERROR | WARNING | NOTICE | NONE
+language: JAVASCRIPT
 arguments: []
-tree_sitter_query: |-
-  (call function: (identifier) @name (#eq? @name "eval"))
+tree_sitter_query: (debugger_statement) @stmt
 code: |-
-  // JavaScript — runs in the Datadog analyzer
-  function visit(node, filename, code) {
-    const fn = node.captures["name"];
-    if (!fn) return;
+  function visit(query, filename, code) {
+    const stmt = query.captures["stmt"];
+    if (!stmt) return;
     addError(buildError(
-      fn.start.line, fn.start.col,
-      fn.end.line, fn.end.col,
-      "Description of the violation",
+      stmt.start.line, stmt.start.col,
+      stmt.end.line, stmt.end.col,
+      "Remove debugger statement before committing to production.",
+      "ERROR",
+      "BEST_PRACTICES"
     ));
   }
 tests:
-  - filename: compliant.py
+  - filename: Compliant.js
     code: |
-      safe_call()   # should NOT be flagged
+      function fetchData() {
+        return fetch("/api/data");
+      }
     annotation_count: 0
-  - filename: not_compliant.py
+  - filename: NotCompliant.js
     code: |
-      eval("1+1")   # should be flagged
+      function fetchData() {
+        debugger;
+        return fetch("/api/data");
+      }
     annotation_count: 1
 is_published: true
 ```
 
-### Supported languages
-
-`PYTHON` `GO` `JAVA` `JAVASCRIPT` `TYPESCRIPT` `RUBY` `KOTLIN` `CSHARP` `RUST` `SWIFT` `PHP` `BASH` `TERRAFORM` `DOCKERFILE` `YAML` `JSON`
-
-### Rule authoring tools
-
-The [Datadog VSCode extension](https://marketplace.visualstudio.com/items?itemName=Datadog.datadog-vscode) includes a rule editor with real-time feedback as you write tree-sitter queries and detection logic. It's the fastest way to iterate on a new rule before pushing.
-
-Additional resources:
-- [Tree-sitter query syntax](https://tree-sitter.github.io/tree-sitter/using-parsers#pattern-matching-with-queries)
-- [Datadog Static Analysis rule writing guide](https://docs.datadoghq.com/code_analysis/static_analysis/rules/)
+> **Note:** The example rule (`my-custom-rules/no-debugger.yaml`) has `is_published: false` and will not appear in Datadog until you set it to `true`. Use it as a reference and delete or replace it with your own rules.
 
 ## Multiple rulesets
 
@@ -131,7 +141,3 @@ rulesets/
     ruleset.yaml
     no-sql-injection.yaml
 ```
-
-## Triggering manually
-
-You can trigger the sync from the **Actions** tab in GitHub without pushing a commit — useful for debugging or re-syncing after a key rotation. Click **Upload Custom Rules → Run workflow**.
