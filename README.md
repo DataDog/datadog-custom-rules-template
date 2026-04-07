@@ -123,7 +123,7 @@ tests:
         return fetch("/api/data");
       }
     annotation_count: 1
-is_published: true
+is_published: false
 ```
 
 > **Note:** The example rule (`my-custom-rules/no-debugger.yaml`) has `is_published: false` and will not appear in Datadog until you set it to `true`. Use it as a reference and delete or replace it with your own rules.
