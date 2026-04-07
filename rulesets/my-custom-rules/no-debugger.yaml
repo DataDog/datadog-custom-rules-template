@@ -1,0 +1,41 @@
+# Example rule — replace or delete this file and add your own rules.
+# See the README for guidance on writing rules.
+name: no-debugger
+short_description: Disallow the use of debugger
+description: |-
+  The `debugger` statement pauses execution and opens the browser debugger. It should
+  never appear in production code as it can expose internals and halt execution for end users.
+  See [CWE-489](https://cwe.mitre.org/data/definitions/489.html).
+category: BEST_PRACTICES
+severity: ERROR
+language: JAVASCRIPT
+checksum: 7329459e9a538c29dceace92528d61fec64d0882e5412eb16937932311a70fbf
+arguments: []
+tree_sitter_query: (debugger_statement) @stmt
+code: |-
+  function visit(query, filename, code) {
+    const stmt = query.captures["stmt"];
+    if (!stmt) return;
+    addError(buildError(
+      stmt.start.line, stmt.start.col,
+      stmt.end.line, stmt.end.col,
+      "Remove debugger statement before committing to production.",
+      "ERROR",
+      "BEST_PRACTICES"
+    ));
+  }
+tests:
+- filename: NotCompliant.js
+  code: |-
+    function fetchData() {
+      debugger;
+      return fetch("/api/data");
+    }
+  annotation_count: 1
+- filename: Compliant.js
+  code: |-
+    function fetchData() {
+      return fetch("/api/data");
+    }
+  annotation_count: 0
+is_published: false
