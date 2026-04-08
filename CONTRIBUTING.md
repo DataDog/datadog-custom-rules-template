@@ -23,7 +23,7 @@ uv sync
 
 1. Fork the repository and create a branch from `main`.
 2. Make your changes to `scripts/upload.py` or `scripts/pull.py`.
-3. Test locally against a staging environment (`DD_SITE=datad0g.com`).
+3. Test locally against your Datadog environment.
 4. Open a pull request.
 
 ## License
