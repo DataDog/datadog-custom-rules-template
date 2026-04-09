@@ -376,7 +376,6 @@ def sync_ruleset(
     exists = remote is not None
     remote_rules = remote["rules"] if exists else {}
 
-    # Pure: compute what needs to change
     to_create, to_update, to_delete = compute_rule_changes(rules, remote_rules)
     rs_changed = not exists or ruleset_has_changed(meta, remote)
 
@@ -384,16 +383,15 @@ def sync_ruleset(
         logger.info("Ruleset: {name} — no changes", name=name)
         return True
 
-    # Execute: upsert ruleset metadata if needed
     if rs_changed:
         if not upsert_ruleset(session, base_url, meta, remote, dry_run):
             return False
 
-    # Execute: delete removed rules
+    # Delete rules removed from disk
     for rule_name in to_delete:
         delete_rule(session, base_url, name, rule_name, dry_run)
 
-    # Execute: create and update rules
+    # Sync each local rule
     failed_rules = []
     for rule in to_create:
         if not push_rule(session, base_url, name, rule, is_new=True, dry_run=dry_run):
