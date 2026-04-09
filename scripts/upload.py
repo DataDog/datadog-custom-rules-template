@@ -132,19 +132,10 @@ def upsert_ruleset(
     meta: dict[str, Any],
     remote: dict[str, Any] | None,
     dry_run: bool,
-) -> bool | None:
-    """Returns True if changed, None if no-op, False if failed."""
+) -> bool:
+    """Create or update ruleset metadata. Only called when a change is needed."""
     name = meta["name"]
     exists = remote is not None
-
-    if exists:
-        changed = (
-            b64(meta.get("short_description", "")) != remote["short_description"]
-            or b64(meta.get("description", "")) != remote["description"]
-        )
-        if not changed:
-            return None
-
     action = "Would update" if exists else "Would create"
     if dry_run:
         logger.info("[dry-run] {action} ruleset: {name}", action=action, name=name)
@@ -260,60 +251,84 @@ def build_revision_payload(rule: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def sync_rule(
+def rule_has_changed(rule: dict[str, Any], remote_rule: dict[str, Any]) -> bool:
+    """Return True if the local rule differs from the remote rule."""
+    local_arguments = [
+        {"name": b64(a["name"]), "description": b64(a.get("description", ""))}
+        for a in rule.get("arguments", [])
+    ]
+    local_tests = [
+        {
+            "filename": t["filename"],
+            "code": b64(t["code"]),
+            "annotation_count": t["annotation_count"],
+        }
+        for t in rule.get("tests", [])
+    ]
+    return (
+        b64(rule.get("short_description", "")) != remote_rule["short_description"]
+        or b64(rule.get("description", "")) != remote_rule["description"]
+        or b64(rule["code"]) != remote_rule["code"]
+        or b64(rule.get("tree_sitter_query", "")) != remote_rule["tree_sitter_query"]
+        or rule["language"] != remote_rule["language"]
+        or rule["severity"] != remote_rule["severity"]
+        or rule["category"] != remote_rule["category"]
+        or local_arguments != remote_rule["arguments"]
+        or local_tests != remote_rule["tests"]
+        or rule.get("is_published", False) != remote_rule["is_published"]
+    )
+
+
+def ruleset_has_changed(meta: dict[str, Any], remote: dict[str, Any]) -> bool:
+    """Return True if the local ruleset metadata differs from the remote."""
+    return (
+        b64(meta.get("short_description", "")) != remote["short_description"]
+        or b64(meta.get("description", "")) != remote["description"]
+    )
+
+
+def compute_rule_changes(
+    local_rules: dict[str, Any],
+    remote_rules: dict[str, Any],
+) -> tuple[list[dict], list[dict], list[str]]:
+    """
+    Pure function. Returns (to_create, to_update, to_delete).
+    - to_create: local rules not present remotely
+    - to_update: local rules that differ from their remote counterpart
+    - to_delete: remote rule names no longer present locally
+    """
+    to_create: list[dict] = []
+    to_update: list[dict] = []
+    for rule in local_rules.values():
+        remote_rule = remote_rules.get(rule["name"])
+        if remote_rule is None:
+            to_create.append(rule)
+        elif rule_has_changed(rule, remote_rule):
+            to_update.append(rule)
+    to_delete = sorted(set(remote_rules) - set(local_rules))
+    return to_create, to_update, to_delete
+
+
+def push_rule(
     session: requests.Session,
     base_url: str,
     ruleset_name: str,
     rule: dict[str, Any],
-    remote_rule: dict[str, Any] | None,
+    is_new: bool,
     dry_run: bool,
-) -> bool | None:
-    """Returns True if changed, None if no-op, False if failed."""
+) -> bool:
+    """Create stub (if new) and push a revision for a rule."""
     rule_name = rule["name"]
     rules_url = f"{base_url}/rulesets/{ruleset_name}/rules"
-    exists = remote_rule is not None
-
-    # Skip if nothing has changed
-    if remote_rule is not None:
-        local_arguments = [
-            {"name": b64(a["name"]), "description": b64(a.get("description", ""))}
-            for a in rule.get("arguments", [])
-        ]
-        local_tests = [
-            {
-                "filename": t["filename"],
-                "code": b64(t["code"]),
-                "annotation_count": t["annotation_count"],
-            }
-            for t in rule.get("tests", [])
-        ]
-        changed = (
-            b64(rule.get("short_description", "")) != remote_rule["short_description"]
-            or b64(rule.get("description", "")) != remote_rule["description"]
-            or b64(rule["code"]) != remote_rule["code"]
-            or b64(rule.get("tree_sitter_query", ""))
-            != remote_rule["tree_sitter_query"]
-            or rule["language"] != remote_rule["language"]
-            or rule["severity"] != remote_rule["severity"]
-            or rule["category"] != remote_rule["category"]
-            or local_arguments != remote_rule["arguments"]
-            or local_tests != remote_rule["tests"]
-            or rule.get("is_published", False) != remote_rule["is_published"]
-        )
-        if not changed:
-            if dry_run:
-                logger.info("[dry-run] No changes: {rule_name}", rule_name=rule_name)
-            return None
 
     if dry_run:
-        action = "Would update" if exists else "Would create"
+        action = "Would create" if is_new else "Would update"
         logger.info(
             "[dry-run] {action} rule: {rule_name}", action=action, rule_name=rule_name
         )
         return True
 
-    # Create rule stub if it doesn't exist
-    if not exists:
+    if is_new:
         create_payload = {
             "data": {
                 "type": "custom_rule",
@@ -330,7 +345,6 @@ def sync_rule(
             )
             return False
 
-    # Push new revision (is_published: true publishes in the same call)
     rev_resp = session.put(
         f"{rules_url}/{rule_name}/revisions",
         json=build_revision_payload(rule),
@@ -345,7 +359,7 @@ def sync_rule(
         )
         return False
 
-    action = "Created" if not exists else "Updated"
+    action = "Created" if is_new else "Updated"
     logger.info("  {action} rule: {rule_name}", action=action, rule_name=rule_name)
     return True
 
@@ -362,25 +376,31 @@ def sync_ruleset(
     exists = remote is not None
     remote_rules = remote["rules"] if exists else {}
 
-    ruleset_changed = upsert_ruleset(session, base_url, meta, remote, dry_run)
-    if ruleset_changed is False:
-        return False
+    # Pure: compute what needs to change
+    to_create, to_update, to_delete = compute_rule_changes(rules, remote_rules)
+    rs_changed = not exists or ruleset_has_changed(meta, remote)
 
-    # Delete rules that are in the backend but no longer on disk
-    deleted_rules = sorted(set(remote_rules) - set(rules))
-    for remote_rule_name in deleted_rules:
-        delete_rule(session, base_url, name, remote_rule_name, dry_run)
+    if not rs_changed and not to_create and not to_update and not to_delete:
+        logger.info("Ruleset: {name} — no changes", name=name)
+        return True
 
-    # Sync each local rule
+    # Execute: upsert ruleset metadata if needed
+    if rs_changed:
+        if not upsert_ruleset(session, base_url, meta, remote, dry_run):
+            return False
+
+    # Execute: delete removed rules
+    for rule_name in to_delete:
+        delete_rule(session, base_url, name, rule_name, dry_run)
+
+    # Execute: create and update rules
     failed_rules = []
-    any_rule_changed = False
-    for rule in rules.values():
-        remote_rule = remote_rules.get(rule["name"])  # None if new, dict if existing
-        result = sync_rule(session, base_url, name, rule, remote_rule, dry_run)
-        if result is False:
+    for rule in to_create:
+        if not push_rule(session, base_url, name, rule, is_new=True, dry_run=dry_run):
             failed_rules.append(rule["name"])
-        elif result is True:
-            any_rule_changed = True
+    for rule in to_update:
+        if not push_rule(session, base_url, name, rule, is_new=False, dry_run=dry_run):
+            failed_rules.append(rule["name"])
 
     if failed_rules:
         logger.error(
@@ -391,11 +411,8 @@ def sync_ruleset(
         )
         return False
 
-    if ruleset_changed is True or any_rule_changed or deleted_rules:
-        action = "updated" if exists else "created"
-        logger.info("Ruleset: {name} — {action}", name=name, action=action)
-    else:
-        logger.info("Ruleset: {name} — no changes", name=name)
+    action = "created" if not exists else "updated"
+    logger.info("Ruleset: {name} — {action}", name=name, action=action)
     return True
 
 
