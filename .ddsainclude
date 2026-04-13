@@ -1,0 +1,5 @@
+rulesets/**/*.yaml
+rulesets/**/*.yml
+
+!rulesets/**/ruleset.yaml
+!rulesets/**/ruleset.yml
