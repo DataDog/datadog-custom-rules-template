@@ -24,6 +24,7 @@ scripts/
 .github/
   workflows/
     upload-rules.yml    # GitHub Action (no changes needed)
+.ddsainclude            # Tells the Datadog extension which files open in the rule editor
 pyproject.toml
 uv.lock
 ```
@@ -70,6 +71,10 @@ To target staging instead of production:
 export DD_SITE=datad0g.com
 uv run scripts/upload.py
 ```
+
+## Datadog VS Code extension
+
+The `.ddsainclude` file controls which YAML files the [Datadog VS Code extension](https://marketplace.visualstudio.com/items?itemName=Datadog.datadog-vscode) automatically opens in the rule editor. By default it includes all rule files under `rulesets/` while excluding `ruleset.yaml` metadata files. If you add new ruleset directories or change your layout, update the glob patterns in `.ddsainclude` to match.
 
 ## Writing rules
 
