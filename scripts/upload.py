@@ -26,6 +26,7 @@ from typing import Any
 import requests
 import yaml
 from loguru import logger
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def setup_logging() -> None:
@@ -39,15 +40,154 @@ def setup_logging() -> None:
 RULESETS_DIR = Path(__file__).parent.parent / "rulesets"
 
 
-
 def b64(s: str) -> str:
     return base64.b64encode(s.encode()).decode()
 
 
-def read_local_rulesets(rulesets_dir: Path) -> dict[str, dict[str, Any]]:
+def _decode(v: str) -> str:
+    return base64.b64decode(v.encode()).decode() if v else v
+
+
+class RemoteArgument(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str
+    description: str = ""
+
+
+class RemoteTest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    filename: str
+    code: str
+    annotation_count: int
+
+
+class RemoteRuleRevision(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    short_description: str = ""
+    description: str = ""
+    code: str = ""
+    tree_sitter_query: str = ""
+    language: str = ""
+    severity: str = ""
+    category: str = ""
+    cwe: str | None = None
+    is_published: bool = False
+    should_use_ai_fix: bool = False
+    is_testing: bool = False
+    tags: list[str] = Field(default_factory=list)
+    arguments: list[RemoteArgument] = Field(default_factory=list)
+    tests: list[RemoteTest] = Field(default_factory=list)
+
+
+class RemoteRule(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str
+    last_revision: RemoteRuleRevision | None = None
+
+
+class RemoteRuleset(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str
+    short_description: str = ""
+    description: str = ""
+
+
+class Argument(BaseModel):
+    name: str
+    description: str = ""
+
+
+class Test(BaseModel):
+    filename: str
+    code: str
+    annotation_count: int
+
+
+class Rule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    short_description: str = ""
+    description: str = ""
+    language: str
+    code: str
+    tree_sitter_query: str = ""
+    severity: str
+    category: str
+    cwe: str | None = None
+    is_published: bool = False
+    should_use_ai_fix: bool = False
+    is_testing: bool = False
+    tags: list[str] = Field(default_factory=list)
+    arguments: list[Argument] = Field(default_factory=list)
+    tests: list[Test] = Field(default_factory=list)
+
+
+class Ruleset(BaseModel):
+    name: str
+    short_description: str = ""
+    description: str = ""
+    id: str | None = None
+    rules: dict[str, Rule | None] = Field(default_factory=dict)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Ruleset):
+            return NotImplemented
+        return (
+            self.name == other.name
+            and self.short_description == other.short_description
+            and self.description == other.description
+            and self.rules == other.rules
+        )
+
+
+
+def remote_rule_to_rule(remote: RemoteRule) -> Rule:
+    rev = remote.last_revision
+    return Rule(
+        name=remote.name,
+        short_description=_decode(rev.short_description),
+        description=_decode(rev.description),
+        code=_decode(rev.code),
+        tree_sitter_query=_decode(rev.tree_sitter_query),
+        language=rev.language,
+        severity=rev.severity,
+        category=rev.category,
+        cwe=rev.cwe,
+        is_published=rev.is_published,
+        should_use_ai_fix=rev.should_use_ai_fix,
+        is_testing=rev.is_testing,
+        tags=rev.tags,
+        arguments=[
+            Argument(name=_decode(a.name), description=_decode(a.description))
+            for a in rev.arguments
+        ],
+        tests=[
+            Test(filename=t.filename, code=_decode(t.code), annotation_count=t.annotation_count)
+            for t in rev.tests
+        ],
+    )
+
+
+def remote_ruleset_to_ruleset(item: dict) -> Ruleset:
+    attrs = item["attributes"]
+    remote = RemoteRuleset(**attrs)
+    rules: dict[str, Rule | None] = {}
+    for r in attrs.get("rules") or []:
+        remote_rule = RemoteRule(**r)
+        rules[remote_rule.name] = remote_rule_to_rule(remote_rule) if remote_rule.last_revision else None
+    return Ruleset(
+        name=remote.name,
+        short_description=_decode(remote.short_description),
+        description=_decode(remote.description),
+        id=item["id"],
+        rules=rules,
+    )
+
+
+def read_local_rulesets(rulesets_dir: Path) -> dict[str, Ruleset]:
     """
-    Walk rulesets_dir and return:
-      { ruleset_name: {"meta": {...}, "rules": {rule_name: rule_dict}} }
+    Walk rulesets_dir and return a dict of Ruleset objects keyed by ruleset name.
     """
     result = {}
     for ruleset_dir in sorted(rulesets_dir.iterdir()):
@@ -63,110 +203,110 @@ def read_local_rulesets(rulesets_dir: Path) -> dict[str, dict[str, Any]]:
         with meta_file.open() as f:
             meta = yaml.safe_load(f)
 
-        rules = {}
+        rules: dict[str, Rule] = {}
         for rule_file in sorted(ruleset_dir.glob("*.yaml")):
             if rule_file.name == "ruleset.yaml":
                 continue
             with rule_file.open() as f:
-                rule = yaml.safe_load(f)
-            rules[rule["name"]] = rule
+                data = yaml.safe_load(f)
+            data.pop("checksum", None)
+            rule = Rule(**data)
+            rules[rule.name] = rule
 
-        result[meta["name"]] = {"meta": meta, "rules": rules}
+        ruleset = Ruleset(**meta, rules=rules)
+        result[ruleset.name] = ruleset
     return result
 
 
-def fetch_remote_rulesets(session: requests.Session, base_url: str) -> dict[str, dict[str, Any]]:
+def fetch_remote_rulesets(session: requests.Session, base_url: str) -> dict[str, Ruleset]:
     """
-    GET /custom/rulesets → returns all rulesets with rules inline.
-    Returns:
-      {
-        ruleset_name: {
-          "id": str,
-          "short_description": str,  # b64 as returned by API
-          "description": str,        # b64 as returned by API
-          "rules": {
-            rule_name: {             # fields from last_revision, b64 as-is
-              "short_description", "description", "code",
-              "tree_sitter_query", "language", "severity", "category"
-            } | None                 # None if rule has no revision yet
-          }
-        }
-      }
+    GET /custom/rulesets → returns all rulesets with rules inline as Ruleset objects.
+    All base64-encoded fields are decoded to plain text via RemoteRule/RemoteRuleset.
     """
     resp = session.get(f"{base_url}/rulesets", timeout=10)
     resp.raise_for_status()
     data = resp.json().get("data") or []
+    return {item["attributes"]["name"]: remote_ruleset_to_ruleset(item) for item in data}
 
-    result = {}
-    for item in data:
-        attrs = item["attributes"]
-        rules = {}
-        for r in attrs.get("rules") or []:
-            rev = r.get("last_revision")
-            rules[r["name"]] = (
-                {
-                    "short_description": rev.get("short_description", ""),
-                    "description": rev.get("description", ""),
-                    "code": rev.get("code", ""),
-                    "tree_sitter_query": rev.get("tree_sitter_query", ""),
-                    "language": rev.get("language", ""),
-                    "severity": rev.get("severity", ""),
-                    "category": rev.get("category", ""),
-                    "arguments": rev.get("arguments") or [],
-                    "tests": rev.get("tests") or [],
-                    "is_published": rev.get("is_published", False),
-                }
-                if rev
-                else None
-            )
-        result[attrs["name"]] = {
-            "id": item["id"],
-            "short_description": attrs.get("short_description", ""),
-            "description": attrs.get("description", ""),
-            "rules": rules,
+
+def build_ruleset_payload(ruleset: Ruleset) -> dict[str, Any]:
+    return {
+        "data": {
+            "type": "custom_ruleset",
+            "attributes": {
+                "id": ruleset.name,
+                "name": ruleset.name,
+                "short_description": b64(ruleset.short_description),
+                "description": b64(ruleset.description),
+            },
         }
-    return result
+    }
+
+
+def build_revision_payload(rule: Rule) -> dict[str, Any]:
+    tests = [
+        {
+            "filename": t.filename,
+            "code": b64(t.code),
+            "annotation_count": t.annotation_count,
+        }
+        for t in rule.tests
+    ]
+    arguments = [
+        {"name": b64(a.name), "description": b64(a.description)}
+        for a in rule.arguments
+    ]
+    return {
+        "data": {
+            "type": "custom_rule_revision",
+            "attributes": {
+                "id": rule.name,
+                "short_description": b64(rule.short_description),
+                "description": b64(rule.description),
+                "language": rule.language,
+                "tree_sitter_query": b64(rule.tree_sitter_query),
+                "code": b64(rule.code),
+                "severity": rule.severity,
+                "category": rule.category,
+                "cwe": rule.cwe,
+                "arguments": arguments,
+                "tests": tests,
+                "is_published": rule.is_published,
+                "should_use_ai_fix": rule.should_use_ai_fix,
+                "is_testing": rule.is_testing,
+                "tags": rule.tags,
+            },
+        }
+    }
 
 
 def upsert_ruleset(
     session: requests.Session,
     base_url: str,
-    meta: dict[str, Any],
-    remote: dict[str, Any] | None,
+    local: Ruleset,
+    remote: Ruleset | None,
     dry_run: bool,
 ) -> bool | None:
     """Returns True if changed, None if no-op, False if failed."""
-    name = meta["name"]
     exists = remote is not None
 
     if exists:
         changed = (
-            b64(meta.get("short_description", "")) != remote["short_description"]
-            or b64(meta.get("description", "")) != remote["description"]
+            local.short_description != remote.short_description
+            or local.description != remote.description
         )
         if not changed:
             return None
 
     action = "Would update" if exists else "Would create"
     if dry_run:
-        logger.info("[dry-run] {action} ruleset: {name}", action=action, name=name)
+        logger.info("[dry-run] {action} ruleset: {name}", action=action, name=local.name)
         return True
 
-    payload = {
-        "data": {
-            "type": "custom_ruleset",
-            "attributes": {
-                "id": name,
-                "name": name,
-                "short_description": b64(meta.get("short_description", "")),
-                "description": b64(meta.get("description", "")),
-            },
-        }
-    }
+    payload = build_ruleset_payload(local)
     if exists:
-        remote_id = remote["id"]
         resp = session.patch(
-            f"{base_url}/rulesets/{remote_id}", json=payload, timeout=10
+            f"{base_url}/rulesets/{remote.id}", json=payload, timeout=10
         )
     else:
         resp = session.put(f"{base_url}/rulesets", json=payload, timeout=10)
@@ -175,7 +315,7 @@ def upsert_ruleset(
         logger.error(
             "FAILED to {action} ruleset {name} — HTTP {status}: {text}",
             action="update" if exists else "create",
-            name=name,
+            name=local.name,
             status=resp.status_code,
             text=resp.text,
         )
@@ -227,85 +367,23 @@ def delete_rule(
     return True
 
 
-def build_revision_payload(rule: dict[str, Any]) -> dict[str, Any]:
-    tests = [
-        {
-            "filename": t["filename"],
-            "code": b64(t["code"]),
-            "annotation_count": t["annotation_count"],
-        }
-        for t in rule.get("tests", [])
-    ]
-    arguments = [
-        {"name": b64(a["name"]), "description": b64(a.get("description", ""))}
-        for a in rule.get("arguments", [])
-    ]
-    return {
-        "data": {
-            "type": "custom_rule_revision",
-            "attributes": {
-                "id": rule["name"],
-                "short_description": b64(rule.get("short_description", "")),
-                "description": b64(rule.get("description", "")),
-                "language": rule["language"],
-                "tree_sitter_query": b64(rule.get("tree_sitter_query", "")),
-                "code": b64(rule["code"]),
-                "severity": rule["severity"],
-                "category": rule["category"],
-                "arguments": arguments,
-                "tests": tests,
-                "is_published": rule.get("is_published", False),
-                "should_use_ai_fix": False,
-                "is_testing": False,
-            },
-        }
-    }
-
-
 def sync_rule(
     session: requests.Session,
     base_url: str,
     ruleset_name: str,
-    rule: dict[str, Any],
-    remote_rule: dict[str, Any] | None,
+    rule: Rule,
+    remote_rule: Rule | None,
     dry_run: bool,
 ) -> bool | None:
     """Returns True if changed, None if no-op, False if failed."""
-    rule_name = rule["name"]
+    rule_name = rule.name
     rules_url = f"{base_url}/rulesets/{ruleset_name}/rules"
     exists = remote_rule is not None
 
-    # Skip if nothing has changed
-    if remote_rule is not None:
-        local_arguments = [
-            {"name": b64(a["name"]), "description": b64(a.get("description", ""))}
-            for a in rule.get("arguments", [])
-        ]
-        local_tests = [
-            {
-                "filename": t["filename"],
-                "code": b64(t["code"]),
-                "annotation_count": t["annotation_count"],
-            }
-            for t in rule.get("tests", [])
-        ]
-        changed = (
-            b64(rule.get("short_description", "")) != remote_rule["short_description"]
-            or b64(rule.get("description", "")) != remote_rule["description"]
-            or b64(rule["code"]) != remote_rule["code"]
-            or b64(rule.get("tree_sitter_query", ""))
-            != remote_rule["tree_sitter_query"]
-            or rule["language"] != remote_rule["language"]
-            or rule["severity"] != remote_rule["severity"]
-            or rule["category"] != remote_rule["category"]
-            or local_arguments != remote_rule["arguments"]
-            or local_tests != remote_rule["tests"]
-            or rule.get("is_published", False) != remote_rule["is_published"]
-        )
-        if not changed:
-            if dry_run:
-                logger.info("[dry-run] No changes: {rule_name}", rule_name=rule_name)
-            return None
+    if remote_rule is not None and rule == remote_rule:
+        if dry_run:
+            logger.info("[dry-run] No changes: {rule_name}", rule_name=rule_name)
+        return None
 
     if dry_run:
         action = "Would update" if exists else "Would create"
@@ -356,38 +434,36 @@ def sync_ruleset(
     session: requests.Session,
     base_url: str,
     dry_run: bool,
-    meta: dict[str, Any],
-    rules: dict[str, dict[str, Any]],
-    remote: dict[str, Any] | None,
+    local: Ruleset,
+    remote: Ruleset | None,
 ) -> bool:
-    name = meta["name"]
     exists = remote is not None
-    remote_rules = remote["rules"] if exists else {}
+    remote_rules = remote.rules if exists else {}
 
-    ruleset_changed = upsert_ruleset(session, base_url, meta, remote, dry_run)
+    ruleset_changed = upsert_ruleset(session, base_url, local, remote, dry_run)
     if ruleset_changed is False:
         return False
 
     # Delete rules that are in the backend but no longer on disk
-    deleted_rules = sorted(set(remote_rules) - set(rules))
+    deleted_rules = sorted(set(remote_rules) - set(local.rules))
     for remote_rule_name in deleted_rules:
-        delete_rule(session, base_url, name, remote_rule_name, dry_run)
+        delete_rule(session, base_url, local.name, remote_rule_name, dry_run)
 
     # Sync each local rule
     failed_rules = []
     any_rule_changed = False
-    for rule in rules.values():
-        remote_rule = remote_rules.get(rule["name"])  # None if new, dict if existing
-        result = sync_rule(session, base_url, name, rule, remote_rule, dry_run)
+    for rule in local.rules.values():
+        remote_rule = remote_rules.get(rule.name)
+        result = sync_rule(session, base_url, local.name, rule, remote_rule, dry_run)
         if result is False:
-            failed_rules.append(rule["name"])
+            failed_rules.append(rule.name)
         elif result is True:
             any_rule_changed = True
 
     if failed_rules:
         logger.error(
             "Ruleset: {name} — {count} rule(s) failed: {rules}",
-            name=name,
+            name=local.name,
             count=len(failed_rules),
             rules=", ".join(failed_rules),
         )
@@ -395,9 +471,9 @@ def sync_ruleset(
 
     if ruleset_changed is True or any_rule_changed or deleted_rules:
         action = "updated" if exists else "created"
-        logger.info("Ruleset: {name} — {action}", name=name, action=action)
+        logger.info("Ruleset: {name} — {action}", name=local.name, action=action)
     else:
-        logger.info("Ruleset: {name} — no changes", name=name)
+        logger.info("Ruleset: {name} — no changes", name=local.name)
     return True
 
 
@@ -455,15 +531,13 @@ def main() -> None:
 
     # Delete rulesets removed from disk
     for name in sorted(set(remote) - set(local)):
-        if not delete_ruleset(session, base_url, remote[name]["id"], dry_run):
+        if not delete_ruleset(session, base_url, remote[name].id, dry_run):
             failures += 1
 
     # Sync local rulesets
     for name, rs in local.items():
-        remote_rs = remote.get(name)  # None if new, dict with id+rules if existing
-        if not sync_ruleset(
-            session, base_url, dry_run, rs["meta"], rs["rules"], remote_rs
-        ):
+        remote_rs = remote.get(name)
+        if not sync_ruleset(session, base_url, dry_run, rs, remote_rs):
             failures += 1
 
     if failures:
