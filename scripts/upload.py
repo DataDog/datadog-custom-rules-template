@@ -141,9 +141,9 @@ class Ruleset(BaseModel):
         )
 
 
-
 def remote_rule_to_rule(remote: RemoteRule) -> Rule:
     rev = remote.last_revision
+    assert rev is not None
     return Rule(
         name=remote.name,
         short_description=_decode(rev.short_description),
@@ -186,9 +186,6 @@ def remote_ruleset_to_ruleset(item: dict) -> Ruleset:
 
 
 def read_local_rulesets(rulesets_dir: Path) -> dict[str, Ruleset]:
-    """
-    Walk rulesets_dir and return a dict of Ruleset objects keyed by ruleset name.
-    """
     result = {}
     for ruleset_dir in sorted(rulesets_dir.iterdir()):
         if not ruleset_dir.is_dir():
@@ -219,14 +216,36 @@ def read_local_rulesets(rulesets_dir: Path) -> dict[str, Ruleset]:
 
 
 def fetch_remote_rulesets(session: requests.Session, base_url: str) -> dict[str, Ruleset]:
-    """
-    GET /custom/rulesets → returns all rulesets with rules inline as Ruleset objects.
-    All base64-encoded fields are decoded to plain text via RemoteRule/RemoteRuleset.
-    """
     resp = session.get(f"{base_url}/rulesets", timeout=10)
     resp.raise_for_status()
     data = resp.json().get("data") or []
     return {item["attributes"]["name"]: remote_ruleset_to_ruleset(item) for item in data}
+
+
+# Business logic
+
+
+def ruleset_metadata_changed(local: Ruleset, remote: Ruleset) -> bool:
+    return (
+        local.short_description != remote.short_description
+        or local.description != remote.description
+    )
+
+
+def compute_rule_changes(
+    local: dict[str, Rule],
+    remote: dict[str, Rule | None],
+) -> tuple[list[Rule], list[Rule], list[str]]:
+    to_create = [r for name, r in local.items() if name not in remote]
+    to_update = [
+        r for name, r in local.items()
+        if name in remote and remote[name] is not None and r != remote[name]
+    ]
+    to_delete = sorted(name for name in remote if name not in local)
+    return to_create, to_update, to_delete
+
+
+# Payload builders
 
 
 def build_ruleset_payload(ruleset: Ruleset) -> dict[str, Any]:
@@ -280,41 +299,26 @@ def build_revision_payload(rule: Rule) -> dict[str, Any]:
     }
 
 
-def upsert_ruleset(
+# API calls
+
+
+def api_upsert_ruleset(
     session: requests.Session,
     base_url: str,
     local: Ruleset,
     remote: Ruleset | None,
-    dry_run: bool,
-) -> bool | None:
-    """Returns True if changed, None if no-op, False if failed."""
-    exists = remote is not None
-
-    if exists:
-        changed = (
-            local.short_description != remote.short_description
-            or local.description != remote.description
-        )
-        if not changed:
-            return None
-
-    action = "Would update" if exists else "Would create"
-    if dry_run:
-        logger.info("[dry-run] {action} ruleset: {name}", action=action, name=local.name)
-        return True
-
+) -> bool:
     payload = build_ruleset_payload(local)
-    if exists:
-        resp = session.patch(
-            f"{base_url}/rulesets/{remote.id}", json=payload, timeout=10
-        )
+    if remote is not None:
+        resp = session.patch(f"{base_url}/rulesets/{remote.id}", json=payload, timeout=10)
+        action = "update"
     else:
         resp = session.put(f"{base_url}/rulesets", json=payload, timeout=10)
-
+        action = "create"
     if not resp.ok:
         logger.error(
             "FAILED to {action} ruleset {name} — HTTP {status}: {text}",
-            action="update" if exists else "create",
+            action=action,
             name=local.name,
             status=resp.status_code,
             text=resp.text,
@@ -323,35 +327,70 @@ def upsert_ruleset(
     return True
 
 
-def delete_ruleset(
-    session: requests.Session, base_url: str, name: str, dry_run: bool
+def api_delete_ruleset(
+    session: requests.Session, base_url: str, ruleset_id: str
 ) -> bool:
-    if dry_run:
-        logger.info("[dry-run] Would delete ruleset: {name}", name=name)
-        return True
-    resp = session.delete(f"{base_url}/rulesets/{name}", timeout=10)
+    resp = session.delete(f"{base_url}/rulesets/{ruleset_id}", timeout=10)
     if not resp.ok:
         logger.error(
-            "FAILED to delete ruleset {name} — HTTP {status}: {text}",
-            name=name,
+            "FAILED to delete ruleset {id} — HTTP {status}: {text}",
+            id=ruleset_id,
             status=resp.status_code,
             text=resp.text,
         )
         return False
-    logger.info("Deleted ruleset: {name}", name=name)
+    logger.info("Deleted ruleset: {id}", id=ruleset_id)
     return True
 
 
-def delete_rule(
-    session: requests.Session,
-    base_url: str,
-    ruleset_name: str,
-    rule_name: str,
-    dry_run: bool,
+def api_push_revision(
+    session: requests.Session, base_url: str, ruleset_name: str, rule: Rule
 ) -> bool:
-    if dry_run:
-        logger.info("[dry-run] Would delete rule: {rule_name}", rule_name=rule_name)
-        return True
+    resp = session.put(
+        f"{base_url}/rulesets/{ruleset_name}/rules/{rule.name}/revisions",
+        json=build_revision_payload(rule),
+        timeout=10,
+    )
+    if not resp.ok:
+        logger.error(
+            "FAILED to push revision for {rule_name} — HTTP {status}: {text}",
+            rule_name=rule.name,
+            status=resp.status_code,
+            text=resp.text,
+        )
+        return False
+    return True
+
+
+def api_create_rule(
+    session: requests.Session, base_url: str, ruleset_name: str, rule: Rule
+) -> bool:
+    rules_url = f"{base_url}/rulesets/{ruleset_name}/rules"
+    resp = session.put(
+        rules_url,
+        json={"data": {"type": "custom_rule", "attributes": {"id": rule.name, "name": rule.name}}},
+        timeout=10,
+    )
+    if not resp.ok:
+        logger.error(
+            "FAILED to create rule stub {rule_name} — HTTP {status}: {text}",
+            rule_name=rule.name,
+            status=resp.status_code,
+            text=resp.text,
+        )
+        return False
+    return api_push_revision(session, base_url, ruleset_name, rule)
+
+
+def api_update_rule(
+    session: requests.Session, base_url: str, ruleset_name: str, rule: Rule
+) -> bool:
+    return api_push_revision(session, base_url, ruleset_name, rule)
+
+
+def api_delete_rule(
+    session: requests.Session, base_url: str, ruleset_name: str, rule_name: str
+) -> bool:
     resp = session.delete(
         f"{base_url}/rulesets/{ruleset_name}/rules/{rule_name}", timeout=10
     )
@@ -367,67 +406,7 @@ def delete_rule(
     return True
 
 
-def sync_rule(
-    session: requests.Session,
-    base_url: str,
-    ruleset_name: str,
-    rule: Rule,
-    remote_rule: Rule | None,
-    dry_run: bool,
-) -> bool | None:
-    """Returns True if changed, None if no-op, False if failed."""
-    rule_name = rule.name
-    rules_url = f"{base_url}/rulesets/{ruleset_name}/rules"
-    exists = remote_rule is not None
-
-    if remote_rule is not None and rule == remote_rule:
-        if dry_run:
-            logger.info("[dry-run] No changes: {rule_name}", rule_name=rule_name)
-        return None
-
-    if dry_run:
-        action = "Would update" if exists else "Would create"
-        logger.info(
-            "[dry-run] {action} rule: {rule_name}", action=action, rule_name=rule_name
-        )
-        return True
-
-    # Create rule stub if it doesn't exist
-    if not exists:
-        create_payload = {
-            "data": {
-                "type": "custom_rule",
-                "attributes": {"id": rule_name, "name": rule_name},
-            }
-        }
-        resp = session.put(rules_url, json=create_payload, timeout=10)
-        if not resp.ok:
-            logger.error(
-                "FAILED to create rule stub {rule_name} — HTTP {status}: {text}",
-                rule_name=rule_name,
-                status=resp.status_code,
-                text=resp.text,
-            )
-            return False
-
-    # Push new revision (is_published: true publishes in the same call)
-    rev_resp = session.put(
-        f"{rules_url}/{rule_name}/revisions",
-        json=build_revision_payload(rule),
-        timeout=10,
-    )
-    if not rev_resp.ok:
-        logger.error(
-            "FAILED to push revision for {rule_name} — HTTP {status}: {text}",
-            rule_name=rule_name,
-            status=rev_resp.status_code,
-            text=rev_resp.text,
-        )
-        return False
-
-    action = "Created" if not exists else "Updated"
-    logger.info("  {action} rule: {rule_name}", action=action, rule_name=rule_name)
-    return True
+# Orchestration
 
 
 def sync_ruleset(
@@ -440,25 +419,37 @@ def sync_ruleset(
     exists = remote is not None
     remote_rules = remote.rules if exists else {}
 
-    ruleset_changed = upsert_ruleset(session, base_url, local, remote, dry_run)
-    if ruleset_changed is False:
-        return False
+    needs_upsert = not exists or ruleset_metadata_changed(local, remote)
+    to_create, to_update, to_delete = compute_rule_changes(local.rules, remote_rules)
 
-    # Delete rules that are in the backend but no longer on disk
-    deleted_rules = sorted(set(remote_rules) - set(local.rules))
-    for remote_rule_name in deleted_rules:
-        delete_rule(session, base_url, local.name, remote_rule_name, dry_run)
+    if dry_run:
+        if needs_upsert:
+            action = "Would update" if exists else "Would create"
+            logger.info("[dry-run] {action} ruleset: {name}", action=action, name=local.name)
+        for rule in to_create:
+            logger.info("[dry-run] Would create rule: {name}", name=rule.name)
+        for rule in to_update:
+            logger.info("[dry-run] Would update rule: {name}", name=rule.name)
+        for name in to_delete:
+            logger.info("[dry-run] Would delete rule: {name}", name=name)
+        if not needs_upsert and not to_create and not to_update and not to_delete:
+            logger.info("Ruleset: {name} — no changes", name=local.name)
+        return True
 
-    # Sync each local rule
+    if needs_upsert:
+        if not api_upsert_ruleset(session, base_url, local, remote):
+            return False
+
+    for name in to_delete:
+        api_delete_rule(session, base_url, local.name, name)
+
     failed_rules = []
-    any_rule_changed = False
-    for rule in local.rules.values():
-        remote_rule = remote_rules.get(rule.name)
-        result = sync_rule(session, base_url, local.name, rule, remote_rule, dry_run)
-        if result is False:
+    for rule in to_create:
+        if not api_create_rule(session, base_url, local.name, rule):
             failed_rules.append(rule.name)
-        elif result is True:
-            any_rule_changed = True
+    for rule in to_update:
+        if not api_update_rule(session, base_url, local.name, rule):
+            failed_rules.append(rule.name)
 
     if failed_rules:
         logger.error(
@@ -469,7 +460,7 @@ def sync_ruleset(
         )
         return False
 
-    if ruleset_changed is True or any_rule_changed or deleted_rules:
+    if needs_upsert or to_create or to_update or to_delete:
         action = "updated" if exists else "created"
         logger.info("Ruleset: {name} — {action}", name=local.name, action=action)
     else:
@@ -531,10 +522,11 @@ def main() -> None:
 
     # Delete rulesets removed from disk
     for name in sorted(set(remote) - set(local)):
-        if not delete_ruleset(session, base_url, remote[name].id, dry_run):
+        if dry_run:
+            logger.info("[dry-run] Would delete ruleset: {name}", name=name)
+        elif not api_delete_ruleset(session, base_url, remote[name].id):
             failures += 1
 
-    # Sync local rulesets
     for name, rs in local.items():
         remote_rs = remote.get(name)
         if not sync_ruleset(session, base_url, dry_run, rs, remote_rs):
