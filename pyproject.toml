@@ -8,3 +8,11 @@ dependencies = [
     "pyyaml>=6.0",
     "requests>=2.32",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.pytest.ini_options]
+python_classes = ["Test_*"]
