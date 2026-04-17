@@ -49,52 +49,47 @@ def _decode(v: str) -> str:
 
 
 class RemoteArgument(BaseModel):
-    model_config = ConfigDict(extra="ignore")
     name: str
     description: str = ""
 
 
 class RemoteTest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
     filename: str
     code: str
     annotation_count: int
 
 
 class RemoteRuleRevision(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    short_description: str = ""
-    description: str = ""
-    code: str = ""
-    tree_sitter_query: str = ""
-    language: str = ""
-    severity: str = ""
-    category: str = ""
+    short_description: str
+    description: str
+    code: str
+    tree_sitter_query: str
+    language: str
+    severity: str
+    category: str
     cwe: str | None = None
-    is_published: bool = False
-    should_use_ai_fix: bool = False
-    is_testing: bool = False
+    is_published: bool
+    should_use_ai_fix: bool
+    is_testing: bool
     tags: list[str] = Field(default_factory=list)
     arguments: list[RemoteArgument] = Field(default_factory=list)
     tests: list[RemoteTest] = Field(default_factory=list)
 
 
 class RemoteRule(BaseModel):
-    model_config = ConfigDict(extra="ignore")
     name: str
-    last_revision: RemoteRuleRevision | None = None
+    last_revision: RemoteRuleRevision
 
 
 class RemoteRuleset(BaseModel):
-    model_config = ConfigDict(extra="ignore")
     name: str
-    short_description: str = ""
-    description: str = ""
+    short_description: str
+    description: str
 
 
 class Argument(BaseModel):
     name: str
-    description: str = ""
+    description: str
 
 
 class Test(BaseModel):
@@ -104,18 +99,16 @@ class Test(BaseModel):
 
 
 class Rule(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
     name: str
-    short_description: str = ""
-    description: str = ""
+    short_description: str
+    description: str
     language: str
     code: str
-    tree_sitter_query: str = ""
+    tree_sitter_query: str
     severity: str
     category: str
     cwe: str | None = None
-    is_published: bool = False
+    is_published: bool
     should_use_ai_fix: bool = False
     is_testing: bool = False
     tags: list[str] = Field(default_factory=list)
@@ -125,8 +118,8 @@ class Rule(BaseModel):
 
 class Ruleset(BaseModel):
     name: str
-    short_description: str = ""
-    description: str = ""
+    short_description: str
+    description: str
     id: str | None = None
     rules: dict[str, Rule | None] = Field(default_factory=dict)
 
@@ -143,7 +136,6 @@ class Ruleset(BaseModel):
 
 def remote_rule_to_rule(remote: RemoteRule) -> Rule:
     rev = remote.last_revision
-    assert rev is not None
     return Rule(
         name=remote.name,
         short_description=_decode(rev.short_description),
@@ -163,9 +155,45 @@ def remote_rule_to_rule(remote: RemoteRule) -> Rule:
             for a in rev.arguments
         ],
         tests=[
-            Test(filename=t.filename, code=_decode(t.code), annotation_count=t.annotation_count)
+            Test(
+                filename=t.filename,
+                code=_decode(t.code),
+                annotation_count=t.annotation_count,
+            )
             for t in rev.tests
         ],
+    )
+
+
+def rule_to_remote_rule(local: Rule) -> RemoteRule:
+    return RemoteRule(
+        name=local.name,
+        last_revision=RemoteRuleRevision(
+            short_description=b64(local.short_description),
+            description=b64(local.description),
+            code=b64(local.code),
+            tree_sitter_query=b64(local.tree_sitter_query),
+            language=local.language,
+            severity=local.severity,
+            category=local.category,
+            cwe=local.cwe,
+            is_published=local.is_published,
+            should_use_ai_fix=local.should_use_ai_fix,
+            is_testing=local.is_testing,
+            tags=local.tags,
+            arguments=[
+                RemoteArgument(name=b64(a.name), description=b64(a.description))
+                for a in local.arguments
+            ],
+            tests=[
+                RemoteTest(
+                    filename=t.filename,
+                    code=b64(t.code),
+                    annotation_count=t.annotation_count,
+                )
+                for t in local.tests
+            ],
+        ),
     )
 
 
@@ -175,13 +203,23 @@ def remote_ruleset_to_ruleset(item: dict) -> Ruleset:
     rules: dict[str, Rule | None] = {}
     for r in attrs.get("rules") or []:
         remote_rule = RemoteRule(**r)
-        rules[remote_rule.name] = remote_rule_to_rule(remote_rule) if remote_rule.last_revision else None
+        rules[remote_rule.name] = (
+            remote_rule_to_rule(remote_rule) if remote_rule.last_revision else None
+        )
     return Ruleset(
         name=remote.name,
         short_description=_decode(remote.short_description),
         description=_decode(remote.description),
         id=item["id"],
         rules=rules,
+    )
+
+
+def ruleset_to_remote_ruleset(local: Ruleset) -> RemoteRuleset:
+    return RemoteRuleset(
+        name=local.name,
+        short_description=b64(local.short_description),
+        description=b64(local.description),
     )
 
 
@@ -215,11 +253,17 @@ def read_local_rulesets(rulesets_dir: Path) -> dict[str, Ruleset]:
     return result
 
 
-def fetch_remote_rulesets(session: requests.Session, base_url: str) -> dict[str, Ruleset]:
+def fetch_remote_rulesets(
+    session: requests.Session, base_url: str
+) -> dict[str, Ruleset]:
     resp = session.get(f"{base_url}/rulesets", timeout=10)
     resp.raise_for_status()
+    import json
+
     data = resp.json().get("data") or []
-    return {item["attributes"]["name"]: remote_ruleset_to_ruleset(item) for item in data}
+    return {
+        item["attributes"]["name"]: remote_ruleset_to_ruleset(item) for item in data
+    }
 
 
 # Business logic
@@ -238,7 +282,8 @@ def compute_rule_changes(
 ) -> tuple[list[Rule], list[Rule], list[str]]:
     to_create = [r for name, r in local.items() if name not in remote]
     to_update = [
-        r for name, r in local.items()
+        r
+        for name, r in local.items()
         if name in remote and remote[name] is not None and r != remote[name]
     ]
     to_delete = sorted(name for name in remote if name not in local)
@@ -249,52 +294,21 @@ def compute_rule_changes(
 
 
 def build_ruleset_payload(ruleset: Ruleset) -> dict[str, Any]:
+    remote = ruleset_to_remote_ruleset(ruleset)
     return {
         "data": {
             "type": "custom_ruleset",
-            "attributes": {
-                "id": ruleset.name,
-                "name": ruleset.name,
-                "short_description": b64(ruleset.short_description),
-                "description": b64(ruleset.description),
-            },
+            "attributes": {"id": remote.name, **remote.model_dump()},
         }
     }
 
 
 def build_revision_payload(rule: Rule) -> dict[str, Any]:
-    tests = [
-        {
-            "filename": t.filename,
-            "code": b64(t.code),
-            "annotation_count": t.annotation_count,
-        }
-        for t in rule.tests
-    ]
-    arguments = [
-        {"name": b64(a.name), "description": b64(a.description)}
-        for a in rule.arguments
-    ]
+    remote = rule_to_remote_rule(rule)
     return {
         "data": {
             "type": "custom_rule_revision",
-            "attributes": {
-                "id": rule.name,
-                "short_description": b64(rule.short_description),
-                "description": b64(rule.description),
-                "language": rule.language,
-                "tree_sitter_query": b64(rule.tree_sitter_query),
-                "code": b64(rule.code),
-                "severity": rule.severity,
-                "category": rule.category,
-                "cwe": rule.cwe,
-                "arguments": arguments,
-                "tests": tests,
-                "is_published": rule.is_published,
-                "should_use_ai_fix": rule.should_use_ai_fix,
-                "is_testing": rule.is_testing,
-                "tags": rule.tags,
-            },
+            "attributes": {"id": rule.name, **remote.last_revision.model_dump()},
         }
     }
 
@@ -310,7 +324,9 @@ def api_upsert_ruleset(
 ) -> bool:
     payload = build_ruleset_payload(local)
     if remote is not None:
-        resp = session.patch(f"{base_url}/rulesets/{remote.id}", json=payload, timeout=10)
+        resp = session.patch(
+            f"{base_url}/rulesets/{remote.id}", json=payload, timeout=10
+        )
         action = "update"
     else:
         resp = session.put(f"{base_url}/rulesets", json=payload, timeout=10)
@@ -368,7 +384,12 @@ def api_create_rule(
     rules_url = f"{base_url}/rulesets/{ruleset_name}/rules"
     resp = session.put(
         rules_url,
-        json={"data": {"type": "custom_rule", "attributes": {"id": rule.name, "name": rule.name}}},
+        json={
+            "data": {
+                "type": "custom_rule",
+                "attributes": {"id": rule.name, "name": rule.name},
+            }
+        },
         timeout=10,
     )
     if not resp.ok:
@@ -420,12 +441,15 @@ def sync_ruleset(
     remote_rules = remote.rules if exists else {}
 
     needs_upsert = not exists or ruleset_metadata_changed(local, remote)
+    assert local.rules is not None
     to_create, to_update, to_delete = compute_rule_changes(local.rules, remote_rules)
 
     if dry_run:
         if needs_upsert:
             action = "Would update" if exists else "Would create"
-            logger.info("[dry-run] {action} ruleset: {name}", action=action, name=local.name)
+            logger.info(
+                "[dry-run] {action} ruleset: {name}", action=action, name=local.name
+            )
         for rule in to_create:
             logger.info("[dry-run] Would create rule: {name}", name=rule.name)
         for rule in to_update:
