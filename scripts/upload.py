@@ -258,8 +258,6 @@ def fetch_remote_rulesets(
 ) -> dict[str, Ruleset]:
     resp = session.get(f"{base_url}/rulesets", timeout=10)
     resp.raise_for_status()
-    import json
-
     data = resp.json().get("data") or []
     return {
         item["attributes"]["name"]: remote_ruleset_to_ruleset(item) for item in data
