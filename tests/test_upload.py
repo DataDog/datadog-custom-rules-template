@@ -55,6 +55,8 @@ def make_remote_rule(**kwargs: Any) -> RemoteRule:
         severity=rule.severity,
         category=rule.category,
         is_published=rule.is_published,
+        should_use_ai_fix=rule.should_use_ai_fix,
+        is_testing=rule.is_testing,
         arguments=[
             RemoteArgument(name=encode_b64(a.name), description=encode_b64(a.description))
             for a in rule.arguments
@@ -152,8 +154,9 @@ def test_ruleset_metadata_changed_no_changes():
     ("description", "new full", "old full"),
 ])
 def test_ruleset_metadata_changed_detects_change(field: str, local_val: Any, remote_val: Any):
-    local = Ruleset(name="rs", **{field: local_val})
-    remote = Ruleset(name="rs", **{field: remote_val})
+    base = dict(short_description="desc", description="full")
+    local = Ruleset(name="rs", **{**base, field: local_val})
+    remote = Ruleset(name="rs", **{**base, field: remote_val})
     assert ruleset_metadata_changed(local, remote) is True
 
 
@@ -235,7 +238,7 @@ def test_compute_rule_changes_mixed():
 def test_read_local_rulesets_single_ruleset(tmp_path: Path):
     rs_dir = tmp_path / "my-ruleset"
     rs_dir.mkdir()
-    _write_yaml(rs_dir / "ruleset.yaml", {"name": "my-ruleset", "short_description": "A ruleset"})
+    _write_yaml(rs_dir / "ruleset.yaml", {"name": "my-ruleset", "short_description": "A ruleset", "description": "A description"})
     _write_yaml(rs_dir / "no-eval.yaml", make_rule(name="no-eval").model_dump())
 
     result = read_local_rulesets(tmp_path)
