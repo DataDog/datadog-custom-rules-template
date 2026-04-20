@@ -4,6 +4,15 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "loguru>=0.7",
+    "pydantic>=2.13.0",
     "pyyaml>=6.0",
     "requests>=2.32",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.pytest.ini_options]
+python_classes = ["Test_*"]
