@@ -26,7 +26,7 @@ from typing import Any
 import requests
 import yaml
 from loguru import logger
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 def setup_logging() -> None:
@@ -50,7 +50,8 @@ def _decode(v: str) -> str:
 
 class RemoteArgument(BaseModel):
     name: str
-    description: str = ""
+    description: str
+
 
 
 class RemoteTest(BaseModel):

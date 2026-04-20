@@ -2,9 +2,8 @@ name: Tests
 
 on:
   pull_request:
-    paths:
-      - "scripts/**"
-      - "tests/**"
+    paths-ignore:
+      - "rulesets/**"
 
 permissions:
   contents: read

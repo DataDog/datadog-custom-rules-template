@@ -29,19 +29,18 @@ def encode_b64(s: str) -> str:
 
 
 def make_rule(**kwargs: Any) -> Rule:
-    defaults = dict(
-        name="test-rule",
-        short_description="A test rule",
-        description="A longer description",
-        code="function visit(query) {}",
-        tree_sitter_query="(identifier) @id",
-        language="PYTHON",
-        severity="WARNING",
-        category="SECURITY",
-        is_published=True,
-    )
-    defaults.update(kwargs)
-    return Rule(**defaults)
+    return Rule(**{
+        "name": "test-rule",
+        "short_description": "A test rule",
+        "description": "A longer description",
+        "code": "function visit(node, filename, code) {}",
+        "tree_sitter_query": "(identifier) @id",
+        "language": "JAVASCRIPT",
+        "severity": "WARNING",
+        "category": "BEST_PRACTICES",
+        "is_published": True,
+        **kwargs,
+    })
 
 
 def make_remote_rule(**kwargs: Any) -> RemoteRule:
@@ -83,7 +82,7 @@ def test_remote_rule_to_rule_decodes_fields():
 
     assert rule.name == remote.name
     assert rule.short_description == "A test rule"
-    assert rule.code == "function visit(query) {}"
+    assert rule.code == "function visit(node, filename, code) {}"
     assert rule.tree_sitter_query == "(identifier) @id"
 
 
@@ -99,7 +98,7 @@ def test_remote_rule_to_rule_decodes_arguments():
 
 def test_remote_rule_to_rule_decodes_tests():
     remote = make_remote_rule(
-        tests=[Test(filename="test.py", code="eval('x')", annotation_count=1)]
+        tests=[Test(filename="test.js", code="eval('x')", annotation_count=1)]
     )
     rule = remote_rule_to_rule(remote)
 
@@ -131,12 +130,12 @@ def test_build_revision_payload_encodes_arguments():
 
 def test_build_revision_payload_encodes_test_code():
     rule = make_rule(
-        tests=[Test(filename="test.py", code="eval('x')", annotation_count=1)]
+        tests=[Test(filename="test.js", code="eval('x')", annotation_count=1)]
     )
     attrs = build_revision_payload(rule)["data"]["attributes"]
 
     assert attrs["tests"] == [
-        {"filename": "test.py", "code": encode_b64("eval('x')"), "annotation_count": 1}
+        {"filename": "test.js", "code": encode_b64("eval('x')"), "annotation_count": 1}
     ]
 
 
